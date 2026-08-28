@@ -44,7 +44,6 @@ jobs:
 
     outputs:
       plan_created: ${{ steps.plan.outputs.plan_created }}
-      dirs: ${{ steps.find_dirs.outputs.dirs }}
 
     steps:
 
@@ -66,10 +65,6 @@ jobs:
         with:
           tofu_version: ${{ env.TOFU_VERSION }}
           tofu_wrapper: false
-
-      # ----------------------------------------------------------
-      # Verify OpenTofu
-      # ----------------------------------------------------------
 
       - name: Verify OpenTofu
         shell: bash
@@ -108,42 +103,34 @@ jobs:
           gcloud config set project "${GCP_PROJECT_ID}"
 
       # ----------------------------------------------------------
-      # Identify OpenTofu root directories
+      # Find OpenTofu root directories
       #
-      # Any change under workspace/ triggers the workflow.
+      # Any change under workspace/ triggers this workflow.
       #
-      # Reusable modules under */modules/* are excluded because
-      # they should not be independently planned/applied.
+      # Reusable modules are excluded from direct plan/apply.
       # ----------------------------------------------------------
 
       - name: Find OpenTofu directories
-        id: find_dirs
         shell: bash
         run: |
           set -euo pipefail
 
-          mapfile -t DIRS < <(
-            find workspace \
-              -type f \
-              -name "*.tf" \
-              -not -path "*/modules/*" \
-              -printf '%h\n' |
-            sort -u
-          )
+          DIRS_FILE="${RUNNER_TEMP}/tofu-dirs.txt"
 
-          if [[ "${#DIRS[@]}" -eq 0 ]]; then
+          find workspace \
+            -type f \
+            -name "*.tf" \
+            -not -path "*/modules/*" \
+            -printf '%h\n' |
+            sort -u > "${DIRS_FILE}"
+
+          if [[ ! -s "${DIRS_FILE}" ]]; then
             echo "::error::No OpenTofu root directories found under workspace/"
             exit 1
           fi
 
           echo "OpenTofu root directories found:"
-          printf '%s\n' "${DIRS[@]}"
-
-          {
-            echo "dirs<<EOF"
-            printf '%s\n' "${DIRS[@]}"
-            echo "EOF"
-          } >> "${GITHUB_OUTPUT}"
+          cat "${DIRS_FILE}"
 
       # ----------------------------------------------------------
       # Create plan directory
@@ -153,10 +140,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p "${RUNNER_TEMP}/tofu-plans"
 
       # ==========================================================
-      # OpenTofu Init, Format, Validate and Plan
+      # OPEN TOFU PLAN
       # ==========================================================
 
       - name: Run OpenTofu plan
@@ -165,9 +153,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          DIRS_FILE="${RUNNER_TEMP}/tofu-dirs.txt"
           PLAN_DIRECTORY="${RUNNER_TEMP}/tofu-plans"
 
           while IFS= read -r DIR; do
+
             [[ -z "${DIR}" ]] && continue
 
             echo "::group::OpenTofu - ${DIR}"
@@ -178,14 +168,14 @@ jobs:
             echo "${PWD}"
 
             # --------------------------------------------------
-            # OpenTofu Init
+            # Init
             # --------------------------------------------------
 
             tofu init \
               -input=false
 
             # --------------------------------------------------
-            # OpenTofu Format Check
+            # Format check
             # --------------------------------------------------
 
             tofu fmt \
@@ -193,24 +183,21 @@ jobs:
               -diff
 
             # --------------------------------------------------
-            # OpenTofu Validate
+            # Validate
             # --------------------------------------------------
 
             tofu validate
 
             # --------------------------------------------------
-            # Generate unique plan name
+            # Create unique plan filename
             # --------------------------------------------------
 
-            PLAN_NAME="$(
-              echo "${DIR}" |
-              tr '/' '_'
-            )"
+            PLAN_NAME="$(echo "${DIR}" | tr '/' '_')"
 
             PLAN_FILE="${PLAN_DIRECTORY}/${PLAN_NAME}.tfplan"
 
             # --------------------------------------------------
-            # OpenTofu Plan
+            # Create plan
             # --------------------------------------------------
 
             echo "Creating plan:"
@@ -221,7 +208,7 @@ jobs:
               -out="${PLAN_FILE}"
 
             # --------------------------------------------------
-            # Convert plan to JSON for Checkov
+            # Convert plan to JSON
             # --------------------------------------------------
 
             tofu show \
@@ -230,12 +217,13 @@ jobs:
               > "${PLAN_FILE}.json"
 
             echo "Plan created successfully:"
+
             ls -lh "${PLAN_FILE}"
             ls -lh "${PLAN_FILE}.json"
 
             echo "::endgroup::"
 
-          done <<< "${{ steps.find_dirs.outputs.dirs }}"
+          done < "${DIRS_FILE}"
 
           echo "plan_created=true" >> "${GITHUB_OUTPUT}"
 
@@ -260,13 +248,19 @@ jobs:
           chmod +x "${TFSEC_PATH}"
 
           echo "Verifying tfsec installation:"
+
           "${TFSEC_PATH}" --version
+
+      # ----------------------------------------------------------
+      # Run tfsec
+      # ----------------------------------------------------------
 
       - name: Run tfsec
         shell: bash
         run: |
           set -euo pipefail
 
+          DIRS_FILE="${RUNNER_TEMP}/tofu-dirs.txt"
           TFSEC_PATH="${RUNNER_TEMP}/tfsec"
 
           if [[ ! -x "${TFSEC_PATH}" ]]; then
@@ -275,6 +269,7 @@ jobs:
           fi
 
           while IFS= read -r DIR; do
+
             [[ -z "${DIR}" ]] && continue
 
             echo "::group::tfsec - ${DIR}"
@@ -288,7 +283,7 @@ jobs:
 
             echo "::endgroup::"
 
-          done <<< "${{ steps.find_dirs.outputs.dirs }}"
+          done < "${DIRS_FILE}"
 
       # ==========================================================
       # CHECKOV
@@ -299,34 +294,60 @@ jobs:
         with:
           python-version: "3.x"
 
+      # ----------------------------------------------------------
+      # Install Checkov
+      # ----------------------------------------------------------
+
       - name: Install Checkov
         shell: bash
         run: |
           set -euo pipefail
 
-          python -m pip install --upgrade pip checkov
+          python -m pip install --upgrade pip
+          python -m pip install checkov
 
           checkov --version
+
+      # ----------------------------------------------------------
+      # Run Checkov
+      # ----------------------------------------------------------
 
       - name: Run Checkov
         shell: bash
         run: |
           set -euo pipefail
 
+          DIRS_FILE="${RUNNER_TEMP}/tofu-dirs.txt"
           EXCEPTIONS_FILE="${GITHUB_WORKSPACE}/${CHECKOV_EXCEPTIONS_FILE}"
-          CHECKOV_SKIP_CHECKS=""
+
+          CHECKOV_SKIP_ARGS=()
 
           if [[ -f "${EXCEPTIONS_FILE}" ]]; then
 
             echo "Reading Checkov exceptions from:"
             echo "${EXCEPTIONS_FILE}"
 
-            CHECKOV_SKIP_CHECKS="$(
-              grep -vE '^[[:space:]]*#|^[[:space:]]*$' \
-                "${EXCEPTIONS_FILE}" |
-              tr '\n' ',' |
-              sed 's/,$//'
-            )
+            while IFS= read -r CHECK_ID; do
+
+              # Skip empty lines
+              [[ -z "${CHECK_ID}" ]] && continue
+
+              # Skip comments
+              [[ "${CHECK_ID}" =~ ^[[:space:]]*# ]] && continue
+
+              # Remove leading/trailing whitespace
+              CHECK_ID="$(echo "${CHECK_ID}" | xargs)"
+
+              if [[ -n "${CHECK_ID}" ]]; then
+                echo "Skipping approved Checkov check: ${CHECK_ID}"
+
+                CHECKOV_SKIP_ARGS+=(
+                  "--skip-check"
+                  "${CHECK_ID}"
+                )
+              fi
+
+            done < "${EXCEPTIONS_FILE}"
 
           else
 
@@ -334,24 +355,11 @@ jobs:
 
           fi
 
-          if [[ -n "${CHECKOV_SKIP_CHECKS}" ]]; then
-
-            echo "Approved Checkov exceptions:"
-            echo "${CHECKOV_SKIP_CHECKS}"
-
-          else
-
-            echo "No Checkov exceptions configured."
-
-          fi
-
           while IFS= read -r DIR; do
+
             [[ -z "${DIR}" ]] && continue
 
-            PLAN_NAME="$(
-              echo "${DIR}" |
-              tr '/' '_'
-            )"
+            PLAN_NAME="$(echo "${DIR}" | tr '/' '_')"
 
             PLAN_JSON="${RUNNER_TEMP}/tofu-plans/${PLAN_NAME}.tfplan.json"
 
@@ -363,27 +371,20 @@ jobs:
 
             echo "::group::Checkov - ${DIR}"
 
-            if [[ -n "${CHECKOV_SKIP_CHECKS}" ]]; then
+            echo "Running Checkov against:"
+            echo "${PLAN_JSON}"
 
-              CKV_SKIP_CHECK="${CHECKOV_SKIP_CHECKS}" \
-                checkov \
-                -f "${PLAN_JSON}" \
-                --framework terraform
-
-            else
-
-              checkov \
-                -f "${PLAN_JSON}" \
-                --framework terraform
-
-            fi
+            checkov \
+              -f "${PLAN_JSON}" \
+              --framework terraform \
+              "${CHECKOV_SKIP_ARGS[@]}"
 
             echo "::endgroup::"
 
-          done <<< "${{ steps.find_dirs.outputs.dirs }}"
+          done < "${DIRS_FILE}"
 
       # ==========================================================
-      # UPLOAD PLAN
+      # UPLOAD PLAN ARTIFACT
       # ==========================================================
 
       - name: Upload OpenTofu plan
@@ -397,9 +398,6 @@ jobs:
 
   # ============================================================
   # OPEN TOFU APPLY
-  #
-  # GitHub Environment "production" provides the approval gate
-  # when environment protection rules are available/configured.
   # ============================================================
 
   tofu-apply:
@@ -441,10 +439,6 @@ jobs:
           tofu_version: ${{ env.TOFU_VERSION }}
           tofu_wrapper: false
 
-      # ----------------------------------------------------------
-      # Verify OpenTofu
-      # ----------------------------------------------------------
-
       - name: Verify OpenTofu
         shell: bash
         run: |
@@ -459,7 +453,7 @@ jobs:
         uses: google-github-actions/setup-gcloud@v3
 
       # ----------------------------------------------------------
-      # Authenticate to GCP using WIF
+      # Authenticate to GCP
       # ----------------------------------------------------------
 
       - name: Authenticate to Google Cloud
@@ -482,7 +476,33 @@ jobs:
           gcloud config set project "${GCP_PROJECT_ID}"
 
       # ----------------------------------------------------------
-      # Download EXACT plan generated by Plan job
+      # Find OpenTofu directories again
+      # ----------------------------------------------------------
+
+      - name: Find OpenTofu directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DIRS_FILE="${RUNNER_TEMP}/tofu-dirs.txt"
+
+          find workspace \
+            -type f \
+            -name "*.tf" \
+            -not -path "*/modules/*" \
+            -printf '%h\n' |
+            sort -u > "${DIRS_FILE}"
+
+          if [[ ! -s "${DIRS_FILE}" ]]; then
+            echo "::error::No OpenTofu root directories found."
+            exit 1
+          fi
+
+          echo "OpenTofu directories:"
+          cat "${DIRS_FILE}"
+
+      # ----------------------------------------------------------
+      # Download exact plan
       # ----------------------------------------------------------
 
       - name: Download approved OpenTofu plan
@@ -500,21 +520,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ ! -d "${RUNNER_TEMP}/tofu-plans" ]]; then
+          PLAN_DIRECTORY="${RUNNER_TEMP}/tofu-plans"
+
+          if [[ ! -d "${PLAN_DIRECTORY}" ]]; then
             echo "::error::OpenTofu plan directory not found."
             exit 1
           fi
 
-          echo "Approved plan files:"
+          echo "Downloaded plan files:"
 
-          find "${RUNNER_TEMP}/tofu-plans" \
+          find "${PLAN_DIRECTORY}" \
             -maxdepth 1 \
             -type f \
             -name "*.tfplan" \
             -print
 
       # ==========================================================
-      # Apply EXACT approved plan
+      # APPLY EXACT APPROVED PLAN
       # ==========================================================
 
       - name: Apply approved plan
@@ -522,9 +544,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          DIRS_FILE="${RUNNER_TEMP}/tofu-dirs.txt"
           PLAN_DIRECTORY="${RUNNER_TEMP}/tofu-plans"
 
           while IFS= read -r DIR; do
+
             [[ -z "${DIR}" ]] && continue
 
             echo "::group::OpenTofu Apply - ${DIR}"
@@ -546,10 +570,7 @@ jobs:
             # Locate exact approved plan
             # --------------------------------------------------
 
-            PLAN_NAME="$(
-              echo "${DIR}" |
-              tr '/' '_'
-            )"
+            PLAN_NAME="$(echo "${DIR}" | tr '/' '_')"
 
             PLAN_FILE="${PLAN_DIRECTORY}/${PLAN_NAME}.tfplan"
 
@@ -563,7 +584,7 @@ jobs:
             echo "${PLAN_FILE}"
 
             # --------------------------------------------------
-            # Apply EXACT plan reviewed by approver
+            # Apply EXACT plan generated during Plan job
             # --------------------------------------------------
 
             tofu apply \
@@ -574,4 +595,4 @@ jobs:
 
             echo "::endgroup::"
 
-          done <<< "${{ needs.tofu-plan.outputs.dirs }}"
+          done < "${DIRS_FILE}"
