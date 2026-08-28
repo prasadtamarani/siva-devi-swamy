@@ -3,6 +3,7 @@ project = {
   name            = "siva-devi"
   service_account = "sa-terraform-lz@siva-devi.iam.gserviceaccount.com"
 }
+
 list_of_buckets = [
   {
     project_id          = "siva-devi"
