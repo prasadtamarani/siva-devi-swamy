@@ -1,3 +1,4 @@
+```yaml
 name: OpenTofu Apply Workflow
 
 on:
@@ -249,24 +250,30 @@ jobs:
           set -euo pipefail
 
           TFSEC_VERSION="v1.28.14"
-          TFSEC_DIR="${RUNNER_TEMP}/tfsec"
+          TFSEC_PATH="${RUNNER_TEMP}/tfsec"
 
-          mkdir -p "${TFSEC_DIR}"
+          echo "Installing tfsec ${TFSEC_VERSION}"
 
           curl -sSL \
-            -o "${TFSEC_DIR}/tfsec" \
+            -o "${TFSEC_PATH}" \
             "https://github.com/aquasecurity/tfsec/releases/download/${TFSEC_VERSION}/tfsec-linux-amd64"
 
-          chmod +x "${TFSEC_DIR}/tfsec"
+          chmod +x "${TFSEC_PATH}"
 
-          echo "${TFSEC_DIR}" >> "${GITHUB_PATH}"
-
-          tfsec --version
+          echo "Verifying tfsec installation:"
+          "${TFSEC_PATH}" --version
 
       - name: Run tfsec
         shell: bash
         run: |
           set -euo pipefail
+
+          TFSEC_PATH="${RUNNER_TEMP}/tfsec"
+
+          if [[ ! -x "${TFSEC_PATH}" ]]; then
+            echo "::error::tfsec executable not found at ${TFSEC_PATH}"
+            exit 1
+          fi
 
           while IFS= read -r DIR; do
             [[ -z "${DIR}" ]] && continue
@@ -278,7 +285,7 @@ jobs:
             echo "Running tfsec in:"
             echo "${PWD}"
 
-            tfsec
+            "${TFSEC_PATH}"
 
             echo "::endgroup::"
 
@@ -392,7 +399,8 @@ jobs:
   # ============================================================
   # OPEN TOFU APPLY
   #
-  # GitHub Environment "production" provides the approval gate.
+  # GitHub Environment "production" provides the approval gate
+  # when environment protection rules are available/configured.
   # ============================================================
 
   tofu-apply:
@@ -506,9 +514,9 @@ jobs:
             -name "*.tfplan" \
             -print
 
-      # ----------------------------------------------------------
+      # ==========================================================
       # Apply EXACT approved plan
-      # ----------------------------------------------------------
+      # ==========================================================
 
       - name: Apply approved plan
         shell: bash
@@ -568,3 +576,4 @@ jobs:
             echo "::endgroup::"
 
           done <<< "${{ needs.tofu-plan.outputs.dirs }}"
+```
