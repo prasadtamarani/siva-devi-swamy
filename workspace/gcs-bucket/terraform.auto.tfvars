@@ -25,7 +25,7 @@ list_of_buckets = [
     #   }
     # ]
   },
-    {
+  {
     project_id          = "siva-devi"
     storage_bucket_name = "bkt-siva-devi"
     location            = "asia-south1"
