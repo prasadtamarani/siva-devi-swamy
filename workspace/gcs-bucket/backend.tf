@@ -1,6 +1,6 @@
 terraform {
   backend "gcs" {
     bucket = "test-siva-devi"
-    prefix = "statefile/gcs-03"
+    prefix = "statefile/gcs-09"
   }
 }
