@@ -12,7 +12,7 @@ list_of_buckets = [
     storage_class       = "STANDARD"
     force_destroy       = false
     lifecycle_rules     = []
-    retention_policy    = null 
+    retention_policy    = null
 
     # retention_policy = {
     #   is_locked             = false
