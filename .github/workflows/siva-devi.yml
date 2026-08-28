@@ -1,0 +1,638 @@
+name: OpenTofu Apply Workflow
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'workspace/**'
+      - 'exceptions/**'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tofu-apply-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TOFU_VERSION: "1.12.5"
+  GCP_PROJECT_ID: "siva-devi"
+  GCP_WORKLOAD_IDENTITY_PROVIDER: >-
+    projects/762147796528/locations/global/workloadIdentityPools/siva-devi-tf03/providers/siva-devi-tf03
+  GCP_SERVICE_ACCOUNT: >-
+    sa-siva-devi@siva-devi.iam.gserviceaccount.com
+  CHECKOV_EXCEPTIONS_FILE: "exceptions/terraform-exceptions.txt"
+
+jobs:
+
+  # ============================================================
+  # OPEN TOFU PLAN
+  # ============================================================
+
+  tofu-plan:
+    name: OpenTofu Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      plan_created: ${{ steps.plan.outputs.plan_created }}
+      dirs: ${{ steps.find_dirs.outputs.dirs }}
+
+    steps:
+
+      # ----------------------------------------------------------
+      # Checkout
+      # ----------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ----------------------------------------------------------
+      # Setup OpenTofu
+      # ----------------------------------------------------------
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      # ----------------------------------------------------------
+      # Verify OpenTofu
+      # ----------------------------------------------------------
+
+      - name: Verify OpenTofu
+        run: |
+          set -euo pipefail
+          tofu version
+
+      # ----------------------------------------------------------
+      # Authenticate to GCP using Workload Identity Federation
+      # ----------------------------------------------------------
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      # ----------------------------------------------------------
+      # Verify GCP authentication
+      # ----------------------------------------------------------
+
+      - name: Verify GCP authentication
+        run: |
+          set -euo pipefail
+          gcloud auth list
+          gcloud config set project "${GCP_PROJECT_ID}"
+
+      # ----------------------------------------------------------
+      # Identify OpenTofu directories
+      #
+      # Expected structure:
+      #
+      # workspace/
+      #   <environment/project>/
+      #       *.tf
+      #       terraform.auto.tfvars
+      # ----------------------------------------------------------
+
+      - name: Find OpenTofu directories
+        id: find_dirs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t DIRS < <(
+            find workspace \
+              -type f \
+              -name "*.tf" \
+              -printf '%h\n' |
+            sort -u
+          )
+
+          if [[ "${#DIRS[@]}" -eq 0 ]]; then
+            echo "::error::No OpenTofu directories found under workspace/"
+            exit 1
+          fi
+
+          echo "OpenTofu directories found:"
+          printf '%s\n' "${DIRS[@]}"
+
+          {
+            echo "dirs<<EOF"
+            printf '%s\n' "${DIRS[@]}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      # ----------------------------------------------------------
+      # Create plan directory
+      # ----------------------------------------------------------
+
+      - name: Create plan directory
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/tofu-plans"
+
+      # ----------------------------------------------------------
+      # OpenTofu init, fmt, validate and plan
+      # ----------------------------------------------------------
+
+      - name: Run OpenTofu plan
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PLAN_DIRECTORY="${RUNNER_TEMP}/tofu-plans"
+
+          while IFS= read -r DIR; do
+            [[ -z "${DIR}" ]] && continue
+
+            echo "::group::OpenTofu - ${DIR}"
+
+            cd "${GITHUB_WORKSPACE}/${DIR}"
+
+            echo "Working directory: ${PWD}"
+
+            # --------------------------------------------------
+            # Show variable files
+            #
+            # OpenTofu automatically loads:
+            #   terraform.tfvars
+            #   terraform.tfvars.json
+            #   *.auto.tfvars
+            #   *.auto.tfvars.json
+            # --------------------------------------------------
+
+            echo "Variable files found:"
+            find . -maxdepth 1 -type f \
+              \( \
+                -name "terraform.tfvars" \
+                -o -name "terraform.tfvars.json" \
+                -o -name "*.auto.tfvars" \
+                -o -name "*.auto.tfvars.json" \
+              \) \
+              -print || true
+
+            # --------------------------------------------------
+            # OpenTofu Init
+            # --------------------------------------------------
+
+            tofu init \
+              -input=false \
+              -lockfile=readonly
+
+            # --------------------------------------------------
+            # OpenTofu Format Check
+            # --------------------------------------------------
+
+            tofu fmt \
+              -check \
+              -diff
+
+            # --------------------------------------------------
+            # OpenTofu Validate
+            # --------------------------------------------------
+
+            tofu validate
+
+            # --------------------------------------------------
+            # Generate unique plan name
+            # --------------------------------------------------
+
+            PLAN_NAME="$(
+              echo "${DIR}" |
+              tr '/' '_'
+            )"
+
+            PLAN_FILE="${PLAN_DIRECTORY}/${PLAN_NAME}.tfplan"
+
+            # --------------------------------------------------
+            # OpenTofu Plan
+            #
+            # IMPORTANT:
+            #
+            # Do NOT use:
+            #   -var-file="terraform.tfvars"
+            #
+            # OpenTofu automatically loads terraform.auto.tfvars.
+            # --------------------------------------------------
+
+            echo "Creating plan:"
+            echo "${PLAN_FILE}"
+
+            tofu plan \
+              -input=false \
+              -out="${PLAN_FILE}"
+
+            # --------------------------------------------------
+            # Convert plan to JSON for Checkov
+            # --------------------------------------------------
+
+            tofu show \
+              -json \
+              "${PLAN_FILE}" \
+              > "${PLAN_FILE}.json"
+
+            echo "Plan created successfully:"
+            ls -lh "${PLAN_FILE}"
+            ls -lh "${PLAN_FILE}.json"
+
+            echo "::endgroup::"
+
+          done <<< "${{ steps.find_dirs.outputs.dirs }}"
+
+          echo "plan_created=true" >> "${GITHUB_OUTPUT}"
+
+      # ========================================================
+      # TFSEC
+      # ========================================================
+
+      - name: Install tfsec
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TFSEC_VERSION="v1.28.14"
+
+          curl -sSL \
+            -o /usr/local/bin/tfsec \
+            "https://github.com/aquasecurity/tfsec/releases/download/${TFSEC_VERSION}/tfsec-linux-amd64"
+
+          chmod +x /usr/local/bin/tfsec
+
+          tfsec --version
+
+      - name: Run tfsec
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r DIR; do
+            [[ -z "${DIR}" ]] && continue
+
+            echo "::group::tfsec - ${DIR}"
+
+            cd "${GITHUB_WORKSPACE}/${DIR}"
+
+            echo "Running tfsec in:"
+            echo "${PWD}"
+
+            # tfsec automatically reads Terraform configuration.
+            # Do not hard-code terraform.tfvars here.
+            tfsec
+
+            echo "::endgroup::"
+
+          done <<< "${{ steps.find_dirs.outputs.dirs }}"
+
+      # ========================================================
+      # CHECKOV
+      # ========================================================
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Checkov
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip checkov
+
+          checkov --version
+
+      - name: Run Checkov
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXCEPTIONS_FILE="${GITHUB_WORKSPACE}/${CHECKOV_EXCEPTIONS_FILE}"
+          CHECKOV_SKIP_CHECKS=""
+
+          # ----------------------------------------------------
+          # Read approved Checkov exceptions
+          # ----------------------------------------------------
+
+          if [[ -f "${EXCEPTIONS_FILE}" ]]; then
+
+            echo "Reading Checkov exceptions from:"
+            echo "${EXCEPTIONS_FILE}"
+
+            CHECKOV_SKIP_CHECKS="$(
+              grep -vE '^[[:space:]]*#|^[[:space:]]*$' \
+                "${EXCEPTIONS_FILE}" |
+              tr '\n' ',' |
+              sed 's/,$//'
+            )
+
+          else
+
+            echo "No Checkov exception file found."
+
+          fi
+
+          if [[ -n "${CHECKOV_SKIP_CHECKS}" ]]; then
+
+            echo "Approved Checkov exceptions:"
+            echo "${CHECKOV_SKIP_CHECKS}"
+
+          else
+
+            echo "No Checkov exceptions configured."
+
+          fi
+
+          # ----------------------------------------------------
+          # Run Checkov against generated OpenTofu plans
+          # ----------------------------------------------------
+
+          while IFS= read -r DIR; do
+            [[ -z "${DIR}" ]] && continue
+
+            PLAN_NAME="$(
+              echo "${DIR}" |
+              tr '/' '_'
+            )"
+
+            PLAN_JSON="${RUNNER_TEMP}/tofu-plans/${PLAN_NAME}.tfplan.json"
+
+            if [[ ! -f "${PLAN_JSON}" ]]; then
+
+              echo "::error::Checkov plan file not found:"
+              echo "${PLAN_JSON}"
+
+              exit 1
+
+            fi
+
+            echo "::group::Checkov - ${DIR}"
+
+            if [[ -n "${CHECKOV_SKIP_CHECKS}" ]]; then
+
+              CKV_SKIP_CHECK="${CHECKOV_SKIP_CHECKS}" \
+              checkov \
+                -f "${PLAN_JSON}" \
+                --framework terraform
+
+            else
+
+              checkov \
+                -f "${PLAN_JSON}" \
+                --framework terraform
+
+            fi
+
+            echo "::endgroup::"
+
+          done <<< "${{ steps.find_dirs.outputs.dirs }}"
+
+      # ========================================================
+      # UPLOAD PLAN
+      # ========================================================
+
+      - name: Upload OpenTofu plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tofu-plan-${{ github.sha }}
+          path: ${{ runner.temp }}/tofu-plans/
+          if-no-files-found: error
+          retention-days: 5
+
+
+  # ============================================================
+  # MANUAL APPROVAL
+  #
+  # minimum-approvals: 1
+  #
+  # Any ONE authorized approver can approve.
+  # ============================================================
+
+  manual-approval:
+    name: Manual Approval
+    runs-on: ubuntu-latest
+
+    needs:
+      - tofu-plan
+
+    if: needs.tofu-plan.outputs.plan_created == 'true'
+
+    timeout-minutes: 1440
+
+    permissions:
+      issues: write
+
+    steps:
+
+      - name: Await Manual Approval
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.token }}
+
+          # Replace these with the actual GitHub usernames
+          # approved by the client.
+          approvers: user1,user2,user3
+
+          minimum-approvals: 1
+
+          issue-title: "OpenTofu Apply Approval Required"
+
+          issue-body: |
+            ## OpenTofu Deployment Approval Required
+
+            **Repository:** ${{ github.repository }}
+            **Branch:** ${{ github.ref_name }}
+            **Commit:** ${{ github.sha }}
+            **Environment:** Production
+
+            The OpenTofu plan, tfsec scan and Checkov scan
+            have completed successfully.
+
+            Please review the generated OpenTofu plan and
+            approve or deny this deployment.
+
+
+  # ============================================================
+  # OPEN TOFU APPLY
+  # ============================================================
+
+  tofu-apply:
+    name: OpenTofu Apply
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    needs:
+      - tofu-plan
+      - manual-approval
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+
+      # ----------------------------------------------------------
+      # Checkout exact commit
+      # ----------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      # ----------------------------------------------------------
+      # Setup OpenTofu
+      # ----------------------------------------------------------
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      # ----------------------------------------------------------
+      # Verify OpenTofu
+      # ----------------------------------------------------------
+
+      - name: Verify OpenTofu
+        run: |
+          set -euo pipefail
+          tofu version
+
+      # ----------------------------------------------------------
+      # Authenticate to GCP using WIF
+      # ----------------------------------------------------------
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      # ----------------------------------------------------------
+      # Verify GCP authentication
+      # ----------------------------------------------------------
+
+      - name: Verify GCP authentication
+        run: |
+          set -euo pipefail
+
+          gcloud auth list
+
+          gcloud config set project "${GCP_PROJECT_ID}"
+
+      # ----------------------------------------------------------
+      # Download EXACT plan generated by Plan job
+      # ----------------------------------------------------------
+
+      - name: Download approved OpenTofu plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tofu-plan-${{ github.sha }}
+          path: ${{ runner.temp }}/tofu-plans
+
+      # ----------------------------------------------------------
+      # Verify plan artifact
+      # ----------------------------------------------------------
+
+      - name: Verify plan artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d "${RUNNER_TEMP}/tofu-plans" ]]; then
+
+            echo "::error::OpenTofu plan directory not found."
+
+            exit 1
+
+          fi
+
+          echo "Approved plan files:"
+
+          find "${RUNNER_TEMP}/tofu-plans" \
+            -maxdepth 1 \
+            -type f \
+            -name "*.tfplan" \
+            -print
+
+      # ----------------------------------------------------------
+      # Apply approved plan
+      # ----------------------------------------------------------
+
+      - name: Apply approved OpenTofu plan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PLAN_DIRECTORY="${RUNNER_TEMP}/tofu-plans"
+
+          while IFS= read -r DIR; do
+            [[ -z "${DIR}" ]] && continue
+
+            echo "::group::OpenTofu Apply - ${DIR}"
+
+            cd "${GITHUB_WORKSPACE}/${DIR}"
+
+            echo "Working directory:"
+            echo "${PWD}"
+
+            # --------------------------------------------------
+            # Initialize OpenTofu
+            # --------------------------------------------------
+
+            tofu init \
+              -input=false \
+              -lockfile=readonly
+
+            # --------------------------------------------------
+            # Locate exact approved plan
+            # --------------------------------------------------
+
+            PLAN_NAME="$(
+              echo "${DIR}" |
+              tr '/' '_'
+            )"
+
+            PLAN_FILE="${PLAN_DIRECTORY}/${PLAN_NAME}.tfplan"
+
+            if [[ ! -f "${PLAN_FILE}" ]]; then
+
+              echo "::error::Approved plan not found:"
+              echo "${PLAN_FILE}"
+
+              exit 1
+
+            fi
+
+            echo "Applying approved plan:"
+            echo "${PLAN_FILE}"
+
+            # --------------------------------------------------
+            # Apply EXACT plan reviewed by approver
+            # --------------------------------------------------
+
+            tofu apply \
+              -input=false \
+              "${PLAN_FILE}"
+
+            echo "::notice::OpenTofu apply completed successfully for ${DIR}"
+
+            echo "::endgroup::"
+
+          done <<< "${{ needs.tofu-plan.outputs.dirs }}"
