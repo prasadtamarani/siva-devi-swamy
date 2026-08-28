@@ -52,7 +52,7 @@ jobs:
       # ----------------------------------------------------------
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -73,13 +73,6 @@ jobs:
           tofu version
 
       # ----------------------------------------------------------
-      # Setup Google Cloud CLI
-      # ----------------------------------------------------------
-
-      - name: Setup Google Cloud CLI
-        uses: google-github-actions/setup-gcloud@v3
-
-      # ----------------------------------------------------------
       # Authenticate to GCP using Workload Identity Federation
       # ----------------------------------------------------------
 
@@ -89,6 +82,15 @@ jobs:
           project_id: ${{ env.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      # ----------------------------------------------------------
+      # Setup Google Cloud CLI
+      # ----------------------------------------------------------
+
+      - name: Setup Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 363.0.0"
 
       # ----------------------------------------------------------
       # Verify GCP authentication
@@ -294,7 +296,7 @@ jobs:
       # ==========================================================
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.x"
 
@@ -394,7 +396,7 @@ jobs:
       # ==========================================================
 
       - name: Upload OpenTofu plan
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: tofu-plan-${{ github.sha }}
           path: ${{ runner.temp }}/tofu-plans/
@@ -430,7 +432,7 @@ jobs:
       # ----------------------------------------------------------
 
       - name: Checkout exact commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -452,13 +454,6 @@ jobs:
           tofu version
 
       # ----------------------------------------------------------
-      # Setup Google Cloud CLI
-      # ----------------------------------------------------------
-
-      - name: Setup Google Cloud CLI
-        uses: google-github-actions/setup-gcloud@v3
-
-      # ----------------------------------------------------------
       # Authenticate to GCP using WIF
       # ----------------------------------------------------------
 
@@ -468,6 +463,15 @@ jobs:
           project_id: ${{ env.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      # ----------------------------------------------------------
+      # Setup Google Cloud CLI
+      # ----------------------------------------------------------
+
+      - name: Setup Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 363.0.0"
 
       # ----------------------------------------------------------
       # Verify GCP authentication
@@ -512,7 +516,7 @@ jobs:
       # ----------------------------------------------------------
 
       - name: Download approved OpenTofu plan
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: tofu-plan-${{ github.sha }}
           path: ${{ runner.temp }}/tofu-plans
