@@ -1,4 +1,3 @@
-```yaml
 name: OpenTofu Apply Workflow
 
 on:
@@ -576,4 +575,3 @@ jobs:
             echo "::endgroup::"
 
           done <<< "${{ needs.tofu-plan.outputs.dirs }}"
-```
