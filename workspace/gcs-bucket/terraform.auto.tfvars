@@ -38,7 +38,7 @@ list_of_buckets = [
     #   is_locked             = false
     #   retention_period_days = 0    # minimum 1 day to satisfy org policy
     # }
-    # Uncomment when ready to enable archival transition
+    # Uncomment when ready to enable archival  transition
     # lifecycle_rules = [
     #   {
     #     action    = { type = "Delete", storage_class = null }
