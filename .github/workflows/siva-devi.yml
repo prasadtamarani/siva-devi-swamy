@@ -105,58 +105,138 @@ jobs:
           gcloud config set project "${GCP_PROJECT_ID}"
 
       # ----------------------------------------------------------
-      # Find OpenTofu root directories affected by this push
+      # Find ONLY changed OpenTofu root directories
       #
-      # Only directories containing a *.tf file that was
-      # actually added/modified/removed between the previous
-      # and current commit are planned - not every root under
-      # workspace/. Reusable modules are excluded, since they
-      # are not directly planned/applied.
+      # Only files under workspace are considered.
+      #
+      # Supported files:
+      #   *.tf
+      #   *.tfvars
+      #   *.tfvars.json
+      #
+      # Example:
+      #
+      # workspace/ifm-prod/gcs/main.tf
+      #
+      # becomes:
+      #
+      # workspace/ifm-prod/gcs
+      #
+      # Multiple changed files in the same directory are
+      # automatically deduplicated.
       # ----------------------------------------------------------
 
-      - name: Find OpenTofu directories
-        id: find_dirs
+      - name: Find changed OpenTofu directories
         shell: bash
         run: |
           set -euo pipefail
 
           DIRS_FILE="${RUNNER_TEMP}/tofu-dirs.txt"
 
-          BEFORE_SHA="${{ github.event.before }}"
-          AFTER_SHA="${{ github.event.after }}"
+          CURRENT_COMMIT="${{ github.sha }}"
+          PREVIOUS_COMMIT="${{ github.event.before }}"
 
-          # On the first push to a branch, "before" is all zeros.
-          # Diff against an empty tree in that case so every
-          # existing .tf file under workspace/ is picked up.
-          if [[ "${BEFORE_SHA}" =~ ^0+$ ]]; then
-            BEFORE_SHA="$(git hash-object -t tree /dev/null)"
+          echo "Current commit:"
+          echo "${CURRENT_COMMIT}"
+
+          echo "Previous commit:"
+          echo "${PREVIOUS_COMMIT}"
+
+          # ------------------------------------------------------
+          # Get changed files
+          #
+          # For normal pushes, compare the previous commit with
+          # the current commit.
+          #
+          # For the first push where github.event.before can be
+          # all zeros, compare against the empty tree.
+          # ------------------------------------------------------
+
+          if [[ "${PREVIOUS_COMMIT}" =~ ^0+$ ]]; then
+            echo "Initial push detected."
+
+            EMPTY_TREE="$(git hash-object -t tree /dev/null)"
+
+            git diff \
+              --name-only \
+              "${EMPTY_TREE}" \
+              "${CURRENT_COMMIT}" \
+              > "${RUNNER_TEMP}/changed-files.txt"
+          else
+            git diff \
+              --name-only \
+              "${PREVIOUS_COMMIT}" \
+              "${CURRENT_COMMIT}" \
+              > "${RUNNER_TEMP}/changed-files.txt"
           fi
 
-          echo "Diffing changes: ${BEFORE_SHA}..${AFTER_SHA}"
+          echo "Changed files:"
+          cat "${RUNNER_TEMP}/changed-files.txt"
 
-          git diff --name-only "${BEFORE_SHA}" "${AFTER_SHA}" \
-            -- 'workspace/**/*.tf' \
-            | grep -v '/modules/' \
-            | xargs -r -n1 dirname \
-            | sort -u > "${DIRS_FILE}" || true
+          # ------------------------------------------------------
+          # Convert changed files into OpenTofu root directories
+          # ------------------------------------------------------
+
+          : > "${DIRS_FILE}"
+
+          while IFS= read -r FILE; do
+
+            [[ -z "${FILE}" ]] && continue
+
+            # Only process files under workspace/
+            [[ "${FILE}" != workspace/* ]] && continue
+
+            # Only process OpenTofu configuration files
+            case "${FILE}" in
+              *.tf|*.tfvars|*.tfvars.json)
+                ;;
+              *)
+                continue
+                ;;
+            esac
+
+            DIR="$(dirname "${FILE}")"
+
+            # Do not directly plan anything under modules.
+            # This is mainly a safety check in case modules are
+            # ever placed below workspace.
+            if [[ "${DIR}" == workspace/modules/* ]]; then
+              echo "Skipping module directory:"
+              echo "${DIR}"
+              continue
+            fi
+
+            echo "Changed OpenTofu directory:"
+            echo "${DIR}"
+
+            echo "${DIR}" >> "${DIRS_FILE}"
+
+          done < "${RUNNER_TEMP}/changed-files.txt"
+
+          # ------------------------------------------------------
+          # Remove duplicate directories
+          # ------------------------------------------------------
+
+          if [[ -s "${DIRS_FILE}" ]]; then
+            sort -u "${DIRS_FILE}" -o "${DIRS_FILE}"
+          fi
+
+          # ------------------------------------------------------
+          # Display final list
+          # ------------------------------------------------------
 
           if [[ ! -s "${DIRS_FILE}" ]]; then
-            echo "No changed OpenTofu root directories found under workspace/."
-            echo "has_dirs=false" >> "${GITHUB_OUTPUT}"
-            exit 0
+            echo "::notice::No OpenTofu files changed. Nothing to plan."
+          else
+            echo "OpenTofu directories to plan:"
+            cat "${DIRS_FILE}"
           fi
-
-          echo "has_dirs=true" >> "${GITHUB_OUTPUT}"
-
-          echo "Changed OpenTofu root directories:"
-          cat "${DIRS_FILE}"
 
       # ----------------------------------------------------------
       # Create plan directory
       # ----------------------------------------------------------
 
       - name: Create plan directory
-        if: steps.find_dirs.outputs.has_dirs == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -169,13 +249,22 @@ jobs:
 
       - name: Run OpenTofu plan
         id: plan
-        if: steps.find_dirs.outputs.has_dirs == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
           DIRS_FILE="${RUNNER_TEMP}/tofu-dirs.txt"
           PLAN_DIRECTORY="${RUNNER_TEMP}/tofu-plans"
+
+          # ------------------------------------------------------
+          # No changed OpenTofu directories
+          # ------------------------------------------------------
+
+          if [[ ! -s "${DIRS_FILE}" ]]; then
+            echo "No OpenTofu directories require planning."
+            echo "plan_created=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
 
           while IFS= read -r DIR; do
 
@@ -250,6 +339,16 @@ jobs:
 
           done < "${DIRS_FILE}"
 
+          # ------------------------------------------------------
+          # Copy the exact directory list into the artifact
+          #
+          # Apply job will use this list instead of discovering
+          # all workspace directories again.
+          # ------------------------------------------------------
+
+          cp "${DIRS_FILE}" \
+             "${PLAN_DIRECTORY}/tofu-dirs.txt"
+
           echo "plan_created=true" >> "${GITHUB_OUTPUT}"
 
       # ==========================================================
@@ -257,7 +356,7 @@ jobs:
       # ==========================================================
 
       - name: Install tfsec
-        if: steps.find_dirs.outputs.has_dirs == 'true'
+        if: steps.plan.outputs.plan_created == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -282,7 +381,7 @@ jobs:
       # ----------------------------------------------------------
 
       - name: Run tfsec
-        if: steps.find_dirs.outputs.has_dirs == 'true'
+        if: steps.plan.outputs.plan_created == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -317,13 +416,13 @@ jobs:
       # ==========================================================
 
       - name: Setup Python
-        if: steps.find_dirs.outputs.has_dirs == 'true'
+        if: steps.plan.outputs.plan_created == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: "3.x"
 
       - name: Install Checkov
-        if: steps.find_dirs.outputs.has_dirs == 'true'
+        if: steps.plan.outputs.plan_created == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -338,7 +437,7 @@ jobs:
       # ----------------------------------------------------------
 
       - name: Run Checkov
-        if: steps.find_dirs.outputs.has_dirs == 'true'
+        if: steps.plan.outputs.plan_created == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -420,7 +519,7 @@ jobs:
       # ==========================================================
 
       - name: Upload OpenTofu plan
-        if: steps.find_dirs.outputs.has_dirs == 'true'
+        if: steps.plan.outputs.plan_created == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: tofu-plan-${{ github.sha }}
@@ -511,44 +610,6 @@ jobs:
           gcloud config set project "${GCP_PROJECT_ID}"
 
       # ----------------------------------------------------------
-      # Find OpenTofu root directories affected by this push
-      #
-      # Must match the exact same set of directories that the
-      # Plan job planned, since the downloaded .tfplan files
-      # only exist for those directories.
-      # ----------------------------------------------------------
-
-      - name: Find OpenTofu directories
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          DIRS_FILE="${RUNNER_TEMP}/tofu-dirs.txt"
-
-          BEFORE_SHA="${{ github.event.before }}"
-          AFTER_SHA="${{ github.event.after }}"
-
-          if [[ "${BEFORE_SHA}" =~ ^0+$ ]]; then
-            BEFORE_SHA="$(git hash-object -t tree /dev/null)"
-          fi
-
-          echo "Diffing changes: ${BEFORE_SHA}..${AFTER_SHA}"
-
-          git diff --name-only "${BEFORE_SHA}" "${AFTER_SHA}" \
-            -- 'workspace/**/*.tf' \
-            | grep -v '/modules/' \
-            | xargs -r -n1 dirname \
-            | sort -u > "${DIRS_FILE}" || true
-
-          if [[ ! -s "${DIRS_FILE}" ]]; then
-            echo "::error::No OpenTofu root directories found - this should not happen since the Plan job already found changes."
-            exit 1
-          fi
-
-          echo "OpenTofu directories:"
-          cat "${DIRS_FILE}"
-
-      # ----------------------------------------------------------
       # Download exact plan generated by Plan job
       # ----------------------------------------------------------
 
@@ -568,9 +629,16 @@ jobs:
           set -euo pipefail
 
           PLAN_DIRECTORY="${RUNNER_TEMP}/tofu-plans"
+          DIRS_FILE="${PLAN_DIRECTORY}/tofu-dirs.txt"
 
           if [[ ! -d "${PLAN_DIRECTORY}" ]]; then
             echo "::error::OpenTofu plan directory not found."
+            exit 1
+          fi
+
+          if [[ ! -f "${DIRS_FILE}" ]]; then
+            echo "::error::Changed OpenTofu directory list not found:"
+            echo "${DIRS_FILE}"
             exit 1
           fi
 
@@ -582,6 +650,11 @@ jobs:
             -name "*.tfplan" \
             -print
 
+          echo ""
+          echo "OpenTofu directories to apply:"
+
+          cat "${DIRS_FILE}"
+
       # ==========================================================
       # APPLY EXACT PLAN
       # ==========================================================
@@ -591,7 +664,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          DIRS_FILE="${RUNNER_TEMP}/tofu-dirs.txt"
+          DIRS_FILE="${RUNNER_TEMP}/tofu-plans/tofu-dirs.txt"
           PLAN_DIRECTORY="${RUNNER_TEMP}/tofu-plans"
 
           while IFS= read -r DIR; do
