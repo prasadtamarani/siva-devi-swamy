@@ -15,7 +15,7 @@ list_of_buckets = [
 
     # retention_policy = {
     #   is_locked             = false
-    #   retention_period_days = 0    # minimum 1 day to satisfy org policy
+    #   retention_period_days = 0    # minimum 1  day to satisfy org policy
     # }
     # Uncomment when ready to enable archival transition
     # lifecycle_rules = [
