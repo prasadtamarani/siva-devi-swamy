@@ -20,7 +20,7 @@ list_of_buckets = [
     # Uncomment when ready to enable archival transition
     # lifecycle_rules = [
     #   {
-    #     action    = { type = "Delete", storage_class = null }
+    #     action    = { type = "Delete",  storage_class = null }
     #     condition = { age = "365" }
     #   }
     # ]
