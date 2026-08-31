@@ -4,7 +4,7 @@ module "log_bucket" {
     google-beta = google-beta.project-beta
   }
   for_each                    = { for bucket in var.list_of_buckets : bucket.storage_bucket_name => bucket }
-  source                      = "../../modules/gcs-bucket"
+  source                      = "../../../modules/gcs-bucket"
   project_id                  = each.value.project_id
   storage_bucket_name         = each.value.storage_bucket_name
   location                    = each.value.location
